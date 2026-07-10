@@ -25,14 +25,15 @@ import allsky_shared as s
 import os
 import json
 import time
+import math
 import subprocess
 import cv2
 import numpy as np
 
 metaData = {
     "name": "Cloud Forecast",
-    "description": "Day+night cloud cover from the image (RBR / star deficit) with a short-term clear-sky nowcast",
-    "version": "v0.1.0",
+    "description": "Day+night cloud cover from the image (RBR / star deficit) with trend + cloud-motion nowcasts",
+    "version": "v0.2.0",
     "events": [
         "day",
         "night"
@@ -45,6 +46,8 @@ metaData = {
         "clear_pct": "20",
         "overcast_pct": "65",
         "trend_min": "45",
+        "motion_nowcast": "true",
+        "flow_downscale": "4",
         "history_hours": "48",
         "publish_web": "true",
         "debug": "false"
@@ -80,6 +83,18 @@ metaData = {
             "help": "How many minutes of recent history the trend/nowcast is fitted over",
             "type": {"fieldtype": "spinner", "min": 15, "max": 180, "step": 5}
         },
+        "motion_nowcast": {
+            "required": "false",
+            "description": "Cloud-Motion Nowcast",
+            "help": "Track cloud motion between frames (optical flow) and advect it over the zenith — a directional nowcast (“clouds from the SW, zenith clouding over in ~15 min”). Most reliable by day. Falls back to the trend nowcast when motion is unclear.",
+            "type": {"fieldtype": "checkbox"}
+        },
+        "flow_downscale": {
+            "required": "false",
+            "description": "Optical-Flow Downscale",
+            "help": "Downscale factor for the optical-flow computation (higher = faster, coarser). 4 = quarter resolution.",
+            "type": {"fieldtype": "spinner", "min": 2, "max": 8, "step": 1}
+        },
         "history_hours": {
             "required": "false",
             "description": "History (hours)",
@@ -108,12 +123,31 @@ metaData = {
                 "authorurl": "https://github.com/benhartwich",
                 "changes": "Initial day (RBR) + night (star deficit) cloud cover with a trend-based clear-sky nowcast and dashboard json"
             }
+        ],
+        "v0.2.0": [
+            {
+                "author": "Benjamin Hartwich",
+                "authorurl": "https://github.com/benhartwich",
+                "changes": [
+                    "Cloud-motion nowcast: dense optical flow between frames estimates cloud drift; the cloud field is advected over the zenith (upwind sampling) to predict clouding-over / clearing with a time estimate",
+                    "Motion direction is reported as a compass bearing via the fisheye calibration when available"
+                ]
+            }
         ]
     }
 }
 
 _maskCache = {"name": None, "mask": None}
 _starTemplate = None
+_calibCache = {"done": False, "zen": None}
+PREV_FLOW = os.path.join(s.ALLSKY_TMP, "allsky_cloudforecast_prev.png")
+PREV_META = os.path.join(s.ALLSKY_TMP, "allsky_cloudforecast_prevmeta.json")
+_COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+
+def _compass(az):
+    return _COMPASS[int((az % 360) / 22.5 + 0.5) % 16]
 
 
 def _mask(name, shape):
@@ -273,6 +307,127 @@ def _appendHistory(record, hours, publish_web):
     return data
 
 
+def _zenithCalib(H, W):
+    """(cx, cy, fisheye_module_or_None, calibration_or_None). Zenith = optical centre
+    from the fisheye calibration if present, else the image centre."""
+    if not _calibCache["done"]:
+        _calibCache["done"] = True
+        try:
+            import allsky_fisheye as fe
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration.json")
+            _calibCache["zen"] = (fe.load_calibration(p), fe)
+        except Exception:
+            _calibCache["zen"] = None
+    if _calibCache["zen"]:
+        calib, fe = _calibCache["zen"]
+        return calib["cx"], calib["cy"], fe, calib
+    return W / 2.0, H / 2.0, None, None
+
+
+def _cloudFieldSmall(bgr, gray, mask, event, rbr_thr, sw, sh):
+    """A downscaled 0/1 cloud field for advection (day: RBR, night: star deficit)."""
+    msmall = cv2.resize(mask, (sw, sh), interpolation=cv2.INTER_AREA)
+    sky = msmall > 127
+    if event == "day":
+        bs = cv2.resize(bgr, (sw, sh), interpolation=cv2.INTER_AREA).astype(np.float32)
+        b, g, r = cv2.split(bs)
+        field = ((r / (b + 1.0) > rbr_thr) & sky).astype(np.float32)
+    else:
+        H, W = gray.shape
+        cell = 80
+        gw, gh = max(1, W // cell), max(1, H // cell)
+        star = np.zeros((gh, gw), bool)
+        for x, y in _starPoints(gray, mask):
+            star[min(gh - 1, y * gh // H), min(gw - 1, x * gw // W)] = True
+        field = cv2.resize((~star).astype(np.float32), (sw, sh), interpolation=cv2.INTER_LINEAR)
+        field = field * sky
+    return field, sky
+
+
+def _flowNowcast(gray, bgr, mask, event, method, rbr_thr, clear_pct, overcast_pct, downscale):
+    """Optical-flow advection nowcast over the zenith. Returns a dict or None (no usable
+    previous frame). verdict ∈ {clouding over, clearing, holding, calm, unclear}."""
+    H, W = gray.shape
+    sw, sh = W // downscale, H // downscale
+    small = cv2.resize(gray, (sw, sh), interpolation=cv2.INTER_AREA)
+    prev = cv2.imread(PREV_FLOW, cv2.IMREAD_GRAYSCALE)
+    try:
+        meta = json.load(open(PREV_META))
+    except Exception:
+        meta = {}
+    now = time.time()
+    cv2.imwrite(PREV_FLOW, small)
+    try:
+        json.dump({"t": now, "method": method}, open(PREV_META, "w"))
+    except Exception:
+        pass
+    if prev is None or prev.shape != small.shape:
+        return None
+    dt = now - meta.get("t", 0)
+    if meta.get("method") != method or dt < 8 or dt > 360:   # skip transitions / stale gaps
+        return None
+
+    flow = cv2.calcOpticalFlowFarneback(prev, small, None, 0.5, 3, 20, 3, 5, 1.2, 0)
+    field, sky = _cloudFieldSmall(bgr, gray, mask, event, rbr_thr, sw, sh)
+    fx, fy = flow[..., 0], flow[..., 1]
+    mag = np.hypot(fx, fy)
+    sig = sky & (mag > 0.6)
+    if int(sig.sum()) < max(30, 0.01 * int(sky.sum())):
+        return {"verdict": "calm", "confidence": 0.0, "from_az": None,
+                "speed_deg_min": 0.0, "horizon_min": None, "text": "cloud motion calm"}
+    ux, uy = fx[sig] / mag[sig], fy[sig] / mag[sig]
+    coh = float(np.hypot(ux.mean(), uy.mean()))               # 0..1 directional coherence
+    per_min = 60.0 / dt
+    vmx, vmy = float(np.median(fx[sig])) * per_min, float(np.median(fy[sig])) * per_min
+    if coh < 0.3:
+        return {"verdict": "unclear", "confidence": round(coh, 2), "from_az": None,
+                "speed_deg_min": 0.0, "horizon_min": None, "text": "cloud motion unclear"}
+
+    cx, cy, fe, calib = _zenithCalib(H, W)
+    zx, zy = cx / downscale, cy / downscale
+
+    def sample(px, py, rad=3):
+        x0, x1 = max(0, int(px - rad)), min(sw, int(px + rad + 1))
+        y0, y1 = max(0, int(py - rad)), min(sh, int(py + rad + 1))
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return float(field[y0:y1, x0:x1].mean())
+
+    cur = sample(zx, zy)
+    verdict, horizon = "holding", None
+    for t in range(3, 41):
+        val = sample(zx - vmx * t, zy - vmy * t)              # what is upwind now reaches zenith at +t
+        if val is None:
+            break
+        if cur is not None and cur <= 0.5 and val > 0.5:
+            verdict, horizon = "clouding over", t; break
+        if cur is not None and cur > 0.5 and val <= 0.5:
+            verdict, horizon = "clearing", t; break
+
+    from_az = None
+    if fe and calib:
+        try:
+            norm = math.hypot(vmx, vmy) or 1.0
+            fxp, fyp = cx - vmx / norm * 250.0, cy - vmy / norm * 250.0   # upwind point (full px)
+            _alt, from_az = fe.pixel_to_altaz(fxp, fyp, calib)
+            from_az = round(from_az, 0)
+        except Exception:
+            from_az = None
+    a1 = calib["a1"] if calib else 1250.0
+    speed_deg = round(math.hypot(vmx, vmy) * downscale * 90.0 / a1, 2)
+
+    frm = f"from the {_compass(from_az)} " if from_az is not None else ""
+    if verdict == "clouding over":
+        text = f"clouds {frm}— zenith clouding over in ~{horizon} min"
+    elif verdict == "clearing":
+        text = f"clouds {frm}— zenith clearing in ~{horizon} min"
+    else:
+        text = (f"clouds drifting {frm}".strip() + " — zenith holding") if from_az is not None \
+            else "cloud motion steady — zenith holding"
+    return {"verdict": verdict, "confidence": round(coh, 2), "from_az": from_az,
+            "speed_deg_min": speed_deg, "horizon_min": horizon, "text": text}
+
+
 def cloudforecast(params, event):
     if s.image is None:
         return "No image available"
@@ -285,12 +440,12 @@ def cloudforecast(params, event):
 
     shape = s.image.shape[:2]
     mask = _mask(params.get("mask", ""), shape)
+    gray = cv2.cvtColor(s.image, cv2.COLOR_BGR2GRAY) if len(s.image.shape) == 3 else s.image
 
     if event == "day":
         cloud, cmask = _cloudDay(s.image, mask, rbr_thr)
         method = "rbr"
     else:
-        gray = cv2.cvtColor(s.image, cv2.COLOR_BGR2GRAY) if len(s.image.shape) == 3 else s.image
         cloud = _cloudNight(gray, mask)
         cmask = None
         method = "stars"
@@ -312,8 +467,23 @@ def cloudforecast(params, event):
     state = _state(cloud, clear_pct, overcast_pct)
     trend, pred30, text = _nowcast(history, now, cloud, trend_min, clear_pct, overcast_pct, method)
 
+    motion = None
+    if params.get("motion_nowcast", True):
+        try:
+            motion = _flowNowcast(gray, s.image, mask, event, method, rbr_thr,
+                                  clear_pct, overcast_pct, max(2, s.int(params.get("flow_downscale", 4))))
+        except Exception as ex:
+            s.log(1, f"WARNING: cloudforecast motion nowcast failed: {ex}")
+    # prefer the directional motion nowcast when it has a confident verdict
+    if motion and motion.get("verdict") in ("clouding over", "clearing"):
+        text = motion["text"]
+    elif motion and motion.get("verdict") == "holding" and trend == "stable":
+        text = motion["text"]
+
     rec = {"t": now, "cloud": cloud, "method": method, "state": state,
-           "trend": trend, "pred30": pred30}
+           "trend": trend, "pred30": pred30, "nowcast": text}
+    if motion:
+        rec["motion"] = motion
     _appendHistory(rec, s.int(params.get("history_hours", 48)), params.get("publish_web", True))
 
     s.setEnvironmentVariable("AS_CLOUDFRAC", f"{cloud:.0f}")
