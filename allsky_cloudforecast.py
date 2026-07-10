@@ -157,6 +157,12 @@ def _compass(az):
     return _COMPASS[int((az % 360) / 22.5 + 0.5) % 16]
 
 
+def _truthy(v):
+    """Checkbox args arrive from the flow config as the STRING 'true'/'false';
+    'false' is truthy in Python, so parse booleans explicitly."""
+    return v is True or (not isinstance(v, bool) and str(v).strip().lower() in ("true", "1", "yes", "on"))
+
+
 def _mask(name, shape):
     name = (name or "").strip()
     if not name:
@@ -274,7 +280,7 @@ def _websiteDir():
 
 def _uploadRemote(local, fname):
     try:
-        if s.getSetting("useremotewebsite") != "true":
+        if str(s.getSetting("useremotewebsite")).lower() not in ("true", "1", "yes", "on"):
             return
         scripts = s.getEnvironmentVariable("ALLSKY_SCRIPTS") or \
             os.path.join(s.getEnvironmentVariable("ALLSKY_HOME") or os.path.expanduser("~/allsky"), "scripts")
@@ -443,7 +449,7 @@ def cloudforecast(params, event):
     clear_pct = s.asfloat(params.get("clear_pct", 20))
     overcast_pct = s.asfloat(params.get("overcast_pct", 65))
     trend_min = s.int(params.get("trend_min", 45))
-    debug = params.get("debug", False)
+    debug = _truthy(params.get("debug", False))
 
     # Allsky passes event="postcapture" for normal captures; the real day/night signal
     # is s.TOD. Fall back to the event arg only if TOD is unavailable.
@@ -479,7 +485,7 @@ def cloudforecast(params, event):
     trend, pred30, text = _nowcast(history, now, cloud, trend_min, clear_pct, overcast_pct, method)
 
     motion = None
-    if params.get("motion_nowcast", True):
+    if _truthy(params.get("motion_nowcast", True)):
         try:
             motion = _flowNowcast(gray, s.image, mask, tod, method, rbr_thr,
                                   clear_pct, overcast_pct, max(2, s.int(params.get("flow_downscale", 4))))
@@ -495,7 +501,7 @@ def cloudforecast(params, event):
            "trend": trend, "pred30": pred30, "nowcast": text}
     if motion:
         rec["motion"] = motion
-    _appendHistory(rec, s.int(params.get("history_hours", 48)), params.get("publish_web", True))
+    _appendHistory(rec, s.int(params.get("history_hours", 48)), _truthy(params.get("publish_web", True)))
 
     s.setEnvironmentVariable("AS_CLOUDFRAC", f"{cloud:.0f}")
     s.setEnvironmentVariable("AS_SKYSTATE", state)
