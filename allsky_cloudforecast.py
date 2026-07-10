@@ -33,7 +33,7 @@ import numpy as np
 metaData = {
     "name": "Cloud Forecast",
     "description": "Day+night cloud cover from the image (RBR / star deficit) with trend + cloud-motion nowcasts",
-    "version": "v0.2.0",
+    "version": "v0.2.1",
     "events": [
         "day",
         "night"
@@ -132,6 +132,13 @@ metaData = {
                     "Cloud-motion nowcast: dense optical flow between frames estimates cloud drift; the cloud field is advected over the zenith (upwind sampling) to predict clouding-over / clearing with a time estimate",
                     "Motion direction is reported as a compass bearing via the fisheye calibration when available"
                 ]
+            }
+        ],
+        "v0.2.1": [
+            {
+                "author": "Benjamin Hartwich",
+                "authorurl": "https://github.com/benhartwich",
+                "changes": "Use s.TOD (not the postprocess event, which is 'postcapture') to pick the day/night method — fixes the RBR/star-deficit choice"
             }
         ]
     }
@@ -438,11 +445,15 @@ def cloudforecast(params, event):
     trend_min = s.int(params.get("trend_min", 45))
     debug = params.get("debug", False)
 
+    # Allsky passes event="postcapture" for normal captures; the real day/night signal
+    # is s.TOD. Fall back to the event arg only if TOD is unavailable.
+    tod = s.TOD if getattr(s, "TOD", "") in ("day", "night") else ("day" if event == "day" else "night")
+
     shape = s.image.shape[:2]
     mask = _mask(params.get("mask", ""), shape)
     gray = cv2.cvtColor(s.image, cv2.COLOR_BGR2GRAY) if len(s.image.shape) == 3 else s.image
 
-    if event == "day":
+    if tod == "day":
         cloud, cmask = _cloudDay(s.image, mask, rbr_thr)
         method = "rbr"
     else:
@@ -470,7 +481,7 @@ def cloudforecast(params, event):
     motion = None
     if params.get("motion_nowcast", True):
         try:
-            motion = _flowNowcast(gray, s.image, mask, event, method, rbr_thr,
+            motion = _flowNowcast(gray, s.image, mask, tod, method, rbr_thr,
                                   clear_pct, overcast_pct, max(2, s.int(params.get("flow_downscale", 4))))
         except Exception as ex:
             s.log(1, f"WARNING: cloudforecast motion nowcast failed: {ex}")
